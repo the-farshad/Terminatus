@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""terminatus - a Gatus status page in the terminal
+
+Usage:
+  terminatus URL                    Print one snapshot and exit
+  terminatus URL -w, --watch [SEC]  Refresh in place every SEC seconds (default 10; r refreshes now, q quits)
+  terminatus URL -c, --concise      Print a single condensed line instead of the full dashboard
+  terminatus -h, --help             Show this help message and exit
+
+URL is the address of a Gatus instance, such as https://status.example.com. For basic
+authentication, put the credentials in it: https://user:password@status.example.com.
+
+Environment variables:
+  GATUS_URL   The address of the Gatus instance, used when URL is not given.
+  SLOW_MS     The response time, in milliseconds, that fills a meter or a graph (default: 1000).
+"""
+import base64
+import html
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import sys
+import termios
+import time
+import tty
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+SLOW_MS = float(os.environ.get("SLOW_MS", "1000"))
+DETAILS_EVERY = 60  # seconds between fetches of each endpoint's uptime and events
+
+# 256-color palette: a green -> yellow -> red gradient for meters and graphs, greys for text,
+# and one border color per panel.
+RESET, BOLD, RED, GREEN, CYAN = "\033[0m", "\033[1m", "\033[31m", "\033[32m", "\033[36m"
+fg = "\033[38;5;{}m".format
+GC = [fg(c) for c in (41, 77, 113, 149, 185, 221, 215, 209, 203, 197)]
+GOOD, BAD = GC[0], GC[9]
+TXT, LBL, DIM, OFF, TITLE = fg(252), fg(245), fg(241), fg(237), "\033[1;38;5;231m"
+BOX_TOP = fg(72)
+BOX_GROUPS = [fg(c) for c in (104, 67, 139, 109, 173)]
+BAR_W, GRAPH_W = 12, 10
+
+# Braille characters for graphs: each holds two values (left and right dot columns) of 0-4 dots.
+BRAILLE = [chr(0x2800 + left + right) for left in (0, 64, 68, 70, 71) for right in (0, 128, 160, 176, 184)]
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+ANSI = re.compile("\033" r"\[[0-9;]*m")
+
+URL, HOST, HEADERS, NAME = "", "", {}, ""
+COLS = 120
+DETAILS = {}  # endpoint key -> (fetched at, events, 24-hour uptime or None when unknown)
+
+
+# ---------- data ----------
+
+def connect(url):
+    """Sets the address, and a basic authentication header when the URL carries credentials."""
+    global URL, HOST
+    parts = urllib.parse.urlsplit(url if "://" in url else "http://" + url)
+    if parts.username:
+        user = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
+        HEADERS["Authorization"] = "Basic " + base64.b64encode(user.encode()).decode()
+        parts = parts._replace(netloc=parts.netloc.rpartition("@")[2])
+    URL, HOST = urllib.parse.urlunsplit(parts).rstrip("/"), parts.netloc
+
+
+def get(path, raw=False):
+    with urllib.request.urlopen(urllib.request.Request(URL + path, headers=HEADERS), timeout=10) as r:
+        body = r.read().decode()
+    return body if raw else json.loads(body)
+
+
+def page_title():
+    """The title of the status page, or its host name."""
+    try:
+        m = re.search(r"<title>([^<]+)</title>", get("/", raw=True))
+    except Exception:
+        m = None
+    return html.unescape(m.group(1)).strip() if m else HOST
+
+
+def fetch():
+    """Every endpoint with its recent results; its events and uptime are fetched again once a minute."""
+    checks = [c for c in get("/api/v1/endpoints/statuses?page=1&pageSize=100") if c.get("results")]
+    stale = [c["key"] for c in checks if time.time() - DETAILS.get(c["key"], (0,))[0] > DETAILS_EVERY]
+
+    def details(key):
+        """Events and 24-hour uptime; when a request fails, the previous values are kept (none at first)."""
+        path = f"/api/v1/endpoints/{urllib.parse.quote(key)}"
+        _, events, day = DETAILS.get(key, (0, [], None))
+        try:
+            events = get(f"{path}/statuses?page=1&pageSize=1").get("events") or []
+        except Exception:
+            pass
+        try:
+            day = float(get(f"{path}/uptimes/24h"))
+        except Exception:
+            pass
+        return key, (time.time(), events, day)
+
+    with ThreadPoolExecutor(8) as pool:
+        DETAILS.update(pool.map(details, stale))
+    for c in checks:
+        _, c["events"], c["day"] = DETAILS[c["key"]]
+    return checks
+
+
+def up(c):
+    return c["results"][-1]["success"]
+
+
+def timed(c):
+    """Whether the endpoint has response times; external endpoints have none."""
+    return any(r.get("duration") for r in c["results"])
+
+
+def answered(checks):
+    """The successful results of each endpoint that has response times; failures are timeouts, not response times."""
+    return [ok for ok in ([r for r in c["results"] if r["success"]] for c in checks if timed(c)) if ok]
+
+
+def ms(result):
+    return result.get("duration", 0) / 1e6
+
+
+def slow(result):
+    """0-100: how slow a response was, at least 1 so a fast one still shows; a failed check counts as the slowest."""
+    return min(100, max(1, round(ms(result) * 100 / SLOW_MS))) if result["success"] else 100
+
+
+def epoch(ts):
+    """Seconds since the epoch of an RFC 3339 timestamp, such as 2026-01-02T03:04:05.123456789Z or one
+    with a UTC offset like -07:00 (Gatus writes the server's local offset)."""
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)?", ts)
+    t = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    off = m.group(2) or "Z"
+    if off != "Z":
+        t -= (1 if off[0] == "+" else -1) * (int(off[1:3]) * 3600 + int(off[4:6]) * 60)
+    return t
+
+
+def ago(ts):
+    s = max(0, int(time.time() - epoch(ts)))
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return f"{d}d{h:02d}h" if d else f"{h}h{m:02d}m" if h else f"{m}m" if m else f"{s}s"
+
+
+def since(c):
+    """How long the endpoint has been healthy or unhealthy."""
+    changes = [e for e in c["events"] if e.get("type") in ("HEALTHY", "UNHEALTHY")]
+    return ago(changes[-1]["timestamp"]) if changes else ""
+
+
+def reason(c):
+    return "; ".join(c["results"][-1].get("errors") or [])
+
+
+# ---------- drawing ----------
+
+def vlen(s):
+    return len(ANSI.sub("", s))
+
+
+def fit(s, w):
+    """s padded, or cut with …, to w visible columns, colors kept."""
+    if vlen(s) <= w:
+        return s + " " * (w - vlen(s))
+    out, n = "", 0
+    for part in re.split(f"({ANSI.pattern})", s):
+        if ANSI.fullmatch(part):
+            out += part
+        else:
+            take = part[:max(0, w - 1 - n)]
+            out, n = out + take, n + len(take)
+    return out + RESET + "…"
+
+
+def rjust(s, w):
+    return " " * (w - vlen(s)) + s
+
+
+def meter(p, w=BAR_W):
+    """One ■ per cell, each in the gradient color of its position; empty cells are dark."""
+    f = max(1 if p > 0 else 0, (p * w + 50) // 100)
+    return "".join(GC[i * 10 // w] + "■" if i < f else OFF + "■" for i in range(w)) + RESET
+
+
+def graph(h, w, values, colors=None):
+    """Braille area graph of 0-100 values, newest at the right. Each character is colored by its value, or by
+    the matching 0-100 entries of colors when given; taller graphs without colors are colored by height."""
+    pad = [0] * max(0, 2 * w - len(values))
+    v = pad + values[-2 * w:]
+    c = pad + colors[-2 * w:] if colors else v
+    lines = []
+    for row in range(h - 1, -1, -1):
+        dots = [min(4, max(0, (x * h * 4 + 99) // 100 - row * 4)) for x in v]
+        pairs = zip(dots[::2], dots[1::2], c[::2], c[1::2])
+        if h > 1 and not colors:
+            line = GC[(row * 2 + 1) * 10 // (h * 2)] + "".join(BRAILLE[a * 5 + b] for a, b, _, _ in pairs)
+        else:
+            line = "".join(GC[min(9, max(x, y) // 10)] + BRAILLE[a * 5 + b] for a, b, x, y in pairs)
+        lines.append(line + RESET)
+    return lines
+
+
+def checks_bar(ups, w=24):
+    """One ■ per endpoint, green when up and red when down; a share of w cells when there are more."""
+    if len(ups) > w:
+        down = len(ups) - sum(ups)
+        red = max(1 if down else 0, round(down * w / len(ups)))
+        ups = [True] * (w - red) + [False] * red
+    return "".join((GOOD if u else BAD) + "■" for u in sorted(ups)[::-1]) + RESET
+
+
+def strip(results, w):
+    """One ■ per check, newest at the right: green when it passed, red when it failed, dark before the first."""
+    cells = [(GOOD if r["success"] else BAD) + "■" for r in results[-w:]]
+    return OFF + "■" * (w - len(cells)) + "".join(cells) + RESET
+
+
+def uptime(u):
+    if u is None:
+        return f"{DIM}—{RESET}"
+    color = GC[0] if u >= 0.999 else GC[4] if u >= 0.99 else GC[7] if u >= 0.95 else GC[9]
+    return f"{color}{u * 100:.2f}%".replace("100.00%", "100%") + RESET
+
+
+def state(c):
+    return (f"{GOOD}up" if up(c) else f"{BAD}down") + f" {since(c)}{RESET}"
+
+
+# Panels: box_top draws "╭─┤ LEFT ├────┤ RIGHT ├─╮", box_line one row, box_bottom closes the panel.
+def box_top(color, left, right=""):
+    n = COLS - 7 - vlen(left) - (5 + vlen(right) if right else 0)
+    line = f"{color}╭─┤ {TITLE}{left}{RESET}{color} ├{'─' * max(1, n)}"
+    return line + (f"┤ {LBL}{right}{color} ├─" if right else "") + f"╮{RESET}"
+
+
+def box_line(color, text):
+    return f"{color}│{RESET} {fit(text, COLS - 4)} {color}│{RESET}"
+
+
+def box_bottom(color, hint=""):
+    if hint:
+        return f"{color}╰─┤ {LBL}{hint}{color} ├{'─' * max(1, COLS - 7 - vlen(hint))}╯{RESET}"
+    return f"{color}╰{'─' * (COLS - 2)}╯{RESET}"
+
+
+def summary_panel(checks):
+    """How many endpoints are up, their uptime, and the average response time with its history."""
+    days = [c["day"] for c in checks if c["day"] is not None]
+    n_up, day = sum(map(up, checks)), (sum(days) / len(days) if days else None)
+    cells = [f"{LBL}endpoints{RESET} {checks_bar([up(c) for c in checks])} {TXT}{n_up} of {len(checks)} up{RESET}  "
+             f"{LBL}24h{RESET} {uptime(day)}"]
+    times = answered(checks)
+    if times:
+        p = sum(slow(r[-1]) for r in times) // len(times)
+        avg = sum(ms(r[-1]) for r in times) / len(times)
+        cells.append(f"{LBL}response{RESET} {meter(p)} {GC[min(9, p // 10)]}{avg:.0f} ms{RESET} {LBL}on average{RESET}")
+    head = f"{time.strftime('%H:%M:%S')} · {HOST}"
+    out = [box_top(BOX_TOP, f"{SPINNER[int(time.time()) % 10]} {NAME}", head)]
+    if sum(map(vlen, cells)) + 4 <= COLS - 4:
+        out.append(box_line(BOX_TOP, "    ".join(cells)))
+    else:
+        out += [box_line(BOX_TOP, s) for s in cells]
+    if times:
+        # Average over endpoints at each step back from the newest result; the graph is scaled to its peak
+        # (shown on the left) so its shape stays readable, and colored by how slow each moment was.
+        n = max(map(len, times))
+
+        def average(i, f):
+            vals = [f(r[i - n + len(r)]) for r in times if i - n + len(r) >= 0]
+            return sum(vals) / len(vals)
+
+        history, slowness = [average(i, ms) for i in range(n)], [round(average(i, slow)) for i in range(n)]
+        peak, gw = max(history) or 1, COLS - 4 - 9
+        pick = [i * n // (2 * gw) for i in range(2 * gw)]
+        lines = graph(2, gw, [max(1, round(history[i] * 100 / peak)) for i in pick], [slowness[i] for i in pick])
+        out += [box_line(BOX_TOP, f"{LBL}{label:>8}{RESET} {line}") for label, line in zip([f"{peak:.0f} ms", "0 ms"], lines)]
+    return out + [box_bottom(BOX_TOP)]
+
+
+def layout(checks):
+    """The widths shared by every group panel: names, whether there is a response column, the response graph
+    (left out when the terminal is too narrow for it), and the room left for the strip of checks and errors."""
+    with_times = any(map(timed, checks))
+    nw = max(4, max(len(c["name"]) for c in checks))
+    room = COLS - 4 - nw - 26 - (11 + GRAPH_W if with_times else 0)  # columns left for the strip and the reason
+    gw = GRAPH_W
+    if with_times and room < 5:
+        gw, room = 0, room + GRAPH_W + 1
+    return nw, with_times, gw, room
+
+
+def group_panel(name, checks, color, hint, widths):
+    """One row per endpoint: state, response time with its history, uptime, its last checks and, when down, why."""
+    nw, with_times, gw, room = widths
+    down = {c["key"]: reason(c) for c in checks if not up(c)}
+    rw = min(40, max([len(r) + 3 for r in down.values()], default=0))  # room for the error, when one is down
+    hw = max(0, min(10, room), min(100, room - rw))
+    latest = max((c["results"][-1]["timestamp"] for c in checks), key=epoch)
+    out = [box_top(color, name, f"{len(checks) - len(down)} of {len(checks)} up · {ago(latest)} ago"),
+           box_line(color, f"{DIM}  {'name':<{nw}}  {'state':<11}" + (f"  {'response':<{8 + (gw + 1 if gw else 0)}}" if with_times else "")
+                    + f"  {'24h':>7}" + (f"  last {hw} checks" if hw else "") + RESET)]
+    for c in sorted(checks, key=lambda c: (up(c), c["name"].lower())):
+        row = f"{GOOD if up(c) else BAD}●{RESET} {BOLD}{c['name']:<{nw}}{RESET}  {fit(state(c), 11)}"
+        if with_times:
+            if timed(c):
+                last = c["results"][-1]
+                row += f"  {GC[min(9, slow(last) // 10)]}{ms(last):5.0f} ms{RESET}"
+                if gw:
+                    row += " " + graph(1, gw, [slow(r) for r in c["results"]])[0]
+            else:
+                row += f"  {DIM}{'—':>5}{RESET}" + " " * (3 + (gw + 1 if gw else 0))
+        row += f"  {rjust(uptime(c['day']), 7)}" + (f"  {strip(c['results'], hw)}" if hw else "")
+        if c["key"] in down:
+            row += f" {LBL}▸{RESET} {TXT}{down[c['key']]}{RESET}"
+        out.append(box_line(color, row))
+    return out + [box_bottom(color, hint)]
+
+
+def full(checks, hint):
+    groups = {}
+    for c in checks:
+        groups.setdefault(c.get("group") or "", []).append(c)
+    names = sorted(groups, key=lambda g: (g == "", g.lower()))
+    out, widths = summary_panel(checks), layout(checks)
+    for i, g in enumerate(names):
+        out += group_panel(g or "endpoints", groups[g], BOX_GROUPS[i % len(BOX_GROUPS)],
+                           hint if i == len(names) - 1 else "", widths)
+    return "\n".join(out)
+
+
+def concise(checks):
+    down = [c["name"] for c in checks if not up(c)]
+    times = [ms(r[-1]) for r in answered(checks)]
+    parts = [f"{BOLD}{CYAN}{NAME}{RESET} {time.strftime('%H:%M:%S')}",
+             f"{RED if down else GREEN}{len(checks) - len(down)}/{len(checks)} up{RESET}"]
+    if times:
+        parts.append(f"{sum(times) / len(times):.0f}ms avg")
+    if down:
+        parts.append(f"{RED}down:{RESET} {', '.join(down)}")
+    return "  ".join(parts)
+
+
+def problem(e):
+    """Why the status page cannot be read, with a hint for a refused login."""
+    if isinstance(e, urllib.error.HTTPError) and e.code == 401:
+        return f"{e} (check the user name and password in the URL)"
+    return str(e)
+
+
+def draw(checks, error, short, hint):
+    """The dashboard, the concise line, or why the status page cannot be read."""
+    global COLS
+    COLS = max(60, shutil.get_terminal_size((120, 40)).columns)
+    if error is not None:
+        if short:
+            return f"{BOLD}{CYAN}{NAME}{RESET} {time.strftime('%H:%M:%S')}  {RED}cannot read the status page{RESET}"
+        return "\n".join([box_top(BAD, NAME, time.strftime("%H:%M:%S")),
+                          box_line(BAD, f"{BAD}Cannot read the status page.{RESET} {DIM}{URL}: {problem(error)}{RESET}"),
+                          box_bottom(BAD, hint)])
+    if not checks:
+        return f"{NAME}: no endpoints"
+    return concise(checks) if short else full(checks, hint)
+
+
+# ---------- main ----------
+
+def watch(interval, short):
+    """Redraw in place, without a blank flash, until q or Ctrl-C. The status page is read every interval
+    seconds, or at once on r; a resized terminal is redrawn at once from the last data."""
+    fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+    saved = termios.tcgetattr(fd) if fd is not None else None
+    if fd is not None:
+        tty.setcbreak(fd)
+    wake, woken = os.pipe()  # the resize signal writes here, which ends the wait in select
+    os.set_blocking(woken, False)
+    signal.set_wakeup_fd(woken)
+    signal.signal(signal.SIGWINCH, lambda *_: None)
+    hint, checks, error, due = f"r refresh · q quit · every {interval:g}s", [], None, 0.0
+    sys.stdout.write("\033[?25l\033[H\033[2J")
+    try:
+        while True:
+            if time.time() >= due:
+                try:
+                    checks, error = fetch(), None
+                except Exception as e:
+                    error = e
+                due = time.time() + interval
+            text = draw(checks, error, short, hint)
+            sys.stdout.write("\033[H" + text.replace("\n", "\033[K\n") + "\033[K\033[J")
+            sys.stdout.flush()
+            ready = select.select([wake] + ([fd] if fd is not None else []), [], [], max(0.0, due - time.time()))[0]
+            if wake in ready:
+                os.read(wake, 512)
+            if fd in ready:
+                key = os.read(fd, 1)
+                if key in (b"q", b"Q"):
+                    return
+                if key in (b"r", b"R"):
+                    due = 0.0
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if saved:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        sys.stdout.write("\033[?25h\n")
+
+
+def main():
+    global NAME
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet when piped into head
+    args, url, interval, watching, short = sys.argv[1:], os.environ.get("GATUS_URL", ""), 10.0, False, False
+    while args:
+        a = args.pop(0)
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            return
+        if a in ("-w", "--watch"):
+            watching = True
+            if args and re.fullmatch(r"\d+(\.\d+)?", args[0]):
+                interval = max(1.0, float(args.pop(0)))
+        elif a in ("-c", "--concise"):
+            short = True
+        elif not a.startswith("-"):
+            url = a
+        else:
+            sys.exit(f"terminatus: unknown option {a}; see --help")
+    if not url:
+        sys.exit("terminatus: give the address of a Gatus instance, such as terminatus https://status.example.com")
+    connect(url)
+    NAME = page_title()
+    if watching:
+        watch(interval, short)
+        return
+    try:
+        checks = fetch()
+    except Exception as e:
+        sys.exit(f"terminatus: cannot read {URL}: {problem(e)}")
+    print(draw(checks, None, short, ""))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
